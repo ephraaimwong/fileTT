@@ -1,37 +1,43 @@
-import socket
-from spake2 import SPAKE2_A, SPAKE2_B
+#from spake2 import SPAKE2_A, SPAKE2_B
+import receive
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives import hashes
+from spake2 import SPAKE2_A
+from websocket import send
 
-def alice_protocol(conn, pw):
-    alice = SPAKE2_A(pw)
-    conn.sendall(alice.start())
-    # serialize state if desired:
-    state = alice.serialize()
+s = SPAKE2_A(b"our password")
+msg_out = s.start()
+send(msg_out) # this is message A->B
+msg_in = receive()
+key = s.finish(msg_in)
 
-    bob_msg = conn.recv(1024)
-    # restore if serialized:
-    alice = SPAKE2_A.from_serialized(state)
-    K = alice.finish(bob_msg)
+confirm_A = HKDF(key, info="confirm_A", length=32)
+expected_confirm_B = HKDF(key, info="confirm_B", length=32)
+send(confirm_A)
+confirm_B = receive()
+assert confirm_B == expected_confirm_B
 
-    # Key confirmation
-    confirm_A = HKDF(..., info=b"confirm_A").derive(K)
-    conn.sendall(confirm_A)
-    confirm_B = conn.recv(1024)
-    expected_B = HKDF(..., info=b"confirm_B").derive(K)
-    assert confirm_B == expected_B
-    return K
 
-def bob_protocol(conn, pw):
-    bob = SPAKE2_B(pw)
-    conn.sendall(bob.start())
-    alice_msg = conn.recv(1024)
-    K = bob.finish(alice_msg)
+from spake2 import SPAKE2_B
+q = SPAKE2_B(b"our password")
+msg_out = q.start()
+send(msg_out)
+msg_in = receive() # this is message A->B
+key = q.finish(msg_in)
 
-    # Key confirmation (mirror)
-    confirm_A = conn.recv(1024)
-    expected_A = HKDF(..., info=b"confirm_A").derive(K)
-    assert confirm_A == expected_A
-    confirm_B = HKDF(..., info=b"confirm_B").derive(K)
-    conn.sendall(confirm_B)
-    return K
+
+#password = b"our password"
+#
+#alice = SPAKE2_A(password)
+#bob   = SPAKE2_B(password)
+#
+## Each side creates an outbound message
+#msg_from_alice = alice.start()
+#msg_from_bob   = bob.start()
+#
+## Simulate exchanging messages by swapping them
+#shared_key_alice = alice.finish(msg_from_bob)
+#shared_key_bob   = bob.finish(msg_from_alice)
+#
+## Both parties now share the same key
+#print("Alice's key:", shared_key_alice.hex())
+#print("Bob's key:  ", shared_key_bob.hex())
