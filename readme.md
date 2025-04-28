@@ -1,19 +1,5 @@
-
- 
- - Create SPAKE2 server
-	 - 
- - Key Confirmation
-	 - 
- - Use SPAKE2_Symmetric 
-
-
-- Most of the writing will be done to defend why SPAKE2 is secure for this context, and why certain common attacks won't be able to do such things
-
-
-
-___
 # Introduction
-Traditionally, SPAKE2 instances require both sides to agree on two key items: a shared password, and what roles both will play (either as the original client or server). 
+Traditionally, SPAKE2 instances require both sides to agree on two key items: a *shared password*, and *what roles both will play* (either as the original client or server). 
 The protocol requires atleast one message exchange to establish the one time unique session key (a second round is optional to check key-confirmation). Once both users obtain the given session key, and an encryption method of the server's choice, they can then proceed to send messages over a given websocket that the server setups. (Hence the session key acts as the generator for the shared secret key used to encrypt messages). Each message is then encrypted by the session key, and will last for the lifetime of the conversation. 
 
 Of course, the presented limitations of pre-agreement information can be worked around (as will be discussed in a later section), though of course, those workarounds come with their tradeoffs. To start off we will first start with how a traditional SPAKE2 instance is setup. 
@@ -55,7 +41,7 @@ Though for our purposes, this isn't exactly needed, but is good to keep in mind 
 # Encryption 
 We chose the standard cryptography python import from `pip install cryptography.hazmat.primitives`, given that we are dealing with the raw types. 
 
-To encrypt our messages, we chose [HMAC-based Extract-and-Expand Key Derivation Function (HKDF)](https://datatracker.ietf.org/doc/html/rfc5869) along with a basic *SHA256* hash function and add *salt* resulting in the following:
+To encrypt our messages, we chose [HMAC-based Extract-and-Expand Key Derivation Function (HKDF)](https://datatracker.ietf.org/doc/html/rfc5869) along with a basic *SHA256* hash function and add *salt* results in a unique string every time, even if the *same message* is sent for n-large times, which leads us to the following implmentation:
 ```python
 def hkdf_expand(session_secret_key, info, length=32):  
 	salt = os.urandom(16)  
@@ -66,7 +52,7 @@ def hkdf_expand(session_secret_key, info, length=32):
     info=info.encode()  
 ).derive(session_secret_key)
 ```
-We used `.encode()` since we wanted to pass the info through without having to specify the info string to be in byte form.
+We used `.encode()` since we wanted to pass the info through without having to specify the info string to be in byte form. Given HKDF is *HMAC*-based, there is already in-built **padding** at both steps, and is much more than 56 bits (as noted by a length of 32 bytes or *256 bits)*.
 
 From [cryptography.io](https://cryptography.io/en/latest/hazmat/primitives/key-derivation-functions/) docs, we see the use cases for HKDF, in this case being quite fitting for our use case (if not a bit overkill):
 
@@ -79,13 +65,30 @@ From [cryptography.io](https://cryptography.io/en/latest/hazmat/primitives/key-d
 > 
 > [HKDF](https://en.wikipedia.org/wiki/HKDF) (HMAC-based Extract-and-Expand Key Derivation Function) is suitable for deriving keys of a fixed size used for other cryptographic operations.
 
+
+Once one of the users end the session, the key should **no longer be used** and should be considered exposed. If both users wish to contact each other again they should go through the same protocal of a shared password and setting up the initial connection again. Hence, the keys used to communicate should be treated as *one-time throwaway keys*, and are "*updated*" (more accurately remade) everytime the connection is re-established.  
 # WebSockets & Frontend Implementation 
 In order to actually communicate with each other, the server side sets up a websocket server, and the client connects to it. After they exchange their one-time password exchange, they both generate some secret key used for *that session only*. Hence, both users are assumed to be running with the same codebase, and hence will be sharing the same UI setup. After this, the UI/frontend portion takes care of how messages are actually transmitted (given both are using a one-time generated temporary key). 
 
-Once one of the users end the session, the key should **no longer be used** and should be considered exposed. If both users wish to contact each other again they should go through the same protocal of a shared password and setting up the initial connection again. 
+The connection is established thru user A establishing a websocket server. User B connects to the server and both generate the session key locally using their pre-agreed upon password. The keys are generated and checked as described previously and both users can now start to talk to each other with each message being encrypted and decrypted by the same secret key.
+# Extras
 
-## Encryption
-We chose to default to 
+## Establishing a shared password over insecure channels (+5pts)
+To share the initial key over an insecure channel is quite simple. Given only a max of 2 users can talk to each other, Alice and Bob can either call, meet in person, or use some end to end encrypted messaging to text each other a known password. This password could be directly exposed or something that both of them know with a hint. While directly exposing the agreed upon password will easily lead to it being leaked in the initial run, there are several factors that make this method possible to establish over insecure channels (even though PAKE is not built for this):
+- The session key generated is only viewable to those who have the initial agreed upon password **at the correct time**. 
+- Per each attempt an active attacker requires interaction with a legitimate party, with no way to verify the password to work offline. 
+- The session key should **never** be exposed thru wire, where only the agreed upon password grants **only both users** the session key
+- Both users can perform a third check round of verification by exchanging a message signed with their PGP keys. Once both users receive these messages, they can check the signature to ensure that it is indeed the correct user they are talking to. 
+- Without knowledge of the password, an attacker cannot successfully mediate the exchange between both users.
+
+## New Algo design: (+5pts)
+(Given it only said to design and justify but no need to use in the codebase)
+
+Say we wanted to further encrypt our current key for some reason. To start, instead of generating just one session key, we generate 2 session keys (or as we call them for this purpose ciphers). We create an encryption by running these 2 ciphers through, then XOR'ing both of them together to create our new cipher (aka session key). In this manner, the attacker would need to break both encryption schemes to recover the plaintext, assuming at least one cipher remains secure. To implement as such, say we have 2 HKDF instances is as K1 and K2. We use a bitwise XOR operation to create our final key K_3 and simply use that key instead of originally only using K1 to encrypt/decrypt. Both the SALT and info for K1 and K2 must be different. Due to HKDF being relatively lightweight, the additional processing time shouldn't affect processing times in any sigificant capactity,   
+```python
+K_3 = bytes(a ^ b for a, b in zip(K1, K2))
+```
+However, given we are using PAKE with well-known ciphers, there really isn't much reason to do this (save for the fact of extra credit). 
 
 ___
 # Requirements
@@ -93,8 +96,10 @@ ___
 - [x] Each message during Internet transmission must be encrypted using a key with length no less than 56 bits.
 - [x] With a key no less than 56 bits, what cipher you should use?
 - [x] DO NOT directly use the password as the key, how can you generate the same key between Alice and Bob to encrypt messages?
-- [ ] What will be used for padding?
-- [ ] A graphical user interface (GUI) is strongly preferred. When send a message, display the sent ciphertext. When receive a message, display the received ciphertext and decrypted plaintext.
-- [ ] How should Alice and Bob set up an initial connection and also maintain the connection with each other on the Internet? (You may refer to socket/network programming in a particular computer language)
-- [ ] If Alice or Bob sends the same message multiple times (e.g., they may say “ok” many times), it is desirable to generate different ciphertext each time. How to implement this?
-- [ ] Design a key management mechanism to periodically update the key used between Alice and Bob. Justify why the design can enhance security.
+- [x] What will be used for padding?
+- [x] A graphical user interface (GUI) is strongly preferred. When send a message, display the sent ciphertext. When receive a message, display the received ciphertext and decrypted plaintext.
+- [x] How should Alice and Bob set up an initial connection and also maintain the connection with each other on the Internet? (You may refer to socket/network programming in a particular computer language)
+- [x] If Alice or Bob sends the same message multiple times (e.g., they may say “ok” many times), it is desirable to generate different ciphertext each time. How to implement this?
+- [x] Design a key management mechanism to periodically update the key used between Alice and Bob. Justify why the design can enhance security.
+- [x] Think about this scenario: if you can **hide the detailed procedure of your encryption algorithm**, how would you improve the security by designing a new algorithm? For example, you may do two encryptions using different standard ciphers, then XOR the two outputs together. Please give your new design and justify its security and efficiency. (5 pts) 
+- [x] If Alice and Bob do not have a pre-shared password (or passphrase) and wish to establish a secure connection, **they should use a protocol that allows them to authenticate each other and negotiate a shared secret over an insecure channel**. Please explain your design and implement it in your project. Note, if you choose to complete this question, you do not need to assume that Alice and Bob share the same password. (5 pts)
