@@ -1,4 +1,5 @@
 # client.py  (Party A)
+import os
 import socket
 import argparse
 from spake2 import SPAKE2_A
@@ -6,21 +7,21 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.backends import default_backend
 
-def hkdf_expand(key_material, info, length=32):
+def hkdf_expand(session_secret_key, info, length=32):
     """
     Expands key so we can use it for key confirmation.
-    :param key_material: key type
-    :param info: message
+    :param session_secret_key: sesh secret key generated frm SPAKE2
+    :param info: Tag attached to key to identify it
     :param length: keyLength
-    :return:
+    :return: HKDF key
     """
+    salt = os.urandom(16)
     return HKDF(
         algorithm=hashes.SHA256(),
         length=length,
-        salt=None,
-        info=info.encode(),
-        backend=default_backend()
-    ).derive(key_material)
+        salt=salt,
+        info=info.encode()
+    ).derive(session_secret_key)
 
 def send(conn, msg):
     conn.sendall(len(msg).to_bytes(4, 'big') + msg)
