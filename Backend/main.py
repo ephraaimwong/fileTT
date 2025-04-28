@@ -1,12 +1,17 @@
 from fastapi import FastAPI, UploadFile, File, WebSocket, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from spake2 import SPAKE2_A
 import os
 import uuid
 from collections import defaultdict
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+import base64
 
 
 
@@ -32,6 +37,52 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 progress_tracker = defaultdict(lambda: {"progress": 0, "message": "Pending", "completed": False, "canceled": False})
 websocket_clients = defaultdict(list)
 cancel_events = defaultdict(asyncio.Event)
+session_keys = {}  # Store SPAKE2-derived keys per task_id
+
+# SPAKE2 stuff below
+def hkdf_expand(session_secret_key, info, length=32):
+    """
+    Expands key for encryption and key confirmation.
+    :param session_secret_key: Session secret key from SPAKE2
+    :param info: Tag to identify the key
+    :param length: Key length
+    :return: HKDF-derived key
+    """
+    salt = os.urandom(16)
+    return HKDF(
+        algorithm=hashes.SHA256(),
+        length=length,
+        salt=salt,
+        info=info.encode()
+    ).derive(session_secret_key)
+    
+# Encrypt data using AES-GCM
+def encrypt_data(data, key):
+    """
+    Encrypts data using AES-GCM.
+    :param data: Data to encrypt
+    :param key: 32-byte encryption key
+    :return: (iv, ciphertext, tag)
+    """
+    iv = os.urandom(12)
+    cipher = Cipher(algorithms.AES(key), modes.GCM(iv))
+    encryptor = cipher.encryptor()
+    ciphertext = encryptor.update(data) + encryptor.finalize()
+    return iv, ciphertext, encryptor.tag
+
+# Decrypt data using AES-GCM
+def decrypt_data(iv, ciphertext, tag, key):
+    """
+    Decrypts data using AES-GCM.
+    :param iv: Initialization vector
+    :param ciphertext: Encrypted data
+    :param tag: Authentication tag
+    :param key: 32-byte encryption key
+    :return: Decrypted data
+    """
+    cipher = Cipher(algorithms.AES(key), modes.GCM(iv, tag))
+    decryptor = cipher.decryptor()
+    return decryptor.update(ciphertext) + decryptor.finalize()
 
 # WebSocket endpoint for progress updates
 @app.websocket("/ws/progress/{task_id}")
@@ -39,7 +90,21 @@ async def websocket_progress(websocket: WebSocket, task_id: str):
     await websocket.accept()
     websocket_clients[task_id].append(websocket)
     logger.info(f"WebSocket connected for task_id: {task_id}, clients: {len(websocket_clients[task_id])}")
+    
+    # Perform SPAKE2 key exchange
+    spake2_a = SPAKE2_A(os.urandom(32))  # Use random password for simplicity
+    msg_out = spake2_a.start()
+    await websocket.send_json({"spake2_msg": base64.b64encode(msg_out).decode()})
+    
     try:
+        # Receive client's SPAKE2 message
+        msg_in_data = await websocket.receive_json()
+        msg_in = base64.b64decode(msg_in_data.get("spake2_msg", ""))
+        session_key = spake2_a.finish(msg_in)
+        derived_key = hkdf_expand(session_key, "file_encryption")
+        session_keys[task_id] = derived_key
+        logger.info(f"SPAKE2 key exchange completed for task_id: {task_id}")
+        
         while True:
             # send server-side progress updates to the client
             progress_data = progress_tracker[task_id]
@@ -54,6 +119,18 @@ async def websocket_progress(websocket: WebSocket, task_id: str):
                     cancel_events[task_id].set()
                     progress_tracker[task_id]["message"] = "Upload canceled by client"
                     logger.info(f"Cancellation request for task:{task_id} received")
+                elif message.get("action") == "upload_chunk":
+                    # Handle encrypted file chunk
+                    iv = base64.b64decode(message["iv"])
+                    ciphertext = base64.b64decode(message["ciphertext"])
+                    tag = base64.b64decode(message["tag"])
+                    chunk = decrypt_data(iv, ciphertext, tag, session_keys[task_id])
+                    filepath = os.path.join(UPLOAD_DIR, message["filename"])
+                    with open(filepath, "ab") as f:
+                        f.write(chunk)
+                    progress_tracker[task_id]["progress"] = message.get("progress", 0)
+                    progress_tracker[task_id]["message"] = f"Received chunk for {message['filename']}"
+                    logger.info(f"Received chunk for {task_id}, progress: {progress_tracker[task_id]['progress']}%")
             except asyncio.TimeoutError:
                 pass # no message received, continue to send progress updates
             if progress_data["completed"] or progress_data["canceled"]:
@@ -141,9 +218,15 @@ async def upload_file(file: UploadFile = File(...), task_id: str = Form(...)):
                     await file.close()
                     return {"message": f"Upload canceled for {file.filename}", "task_id": task_id}
 
-                bytes_read += len(chunk)
-                f.write(chunk)
+                # Encrypt chunk if session key exists (set via WebSocket)
+                if task_id in session_keys:
+                    iv, ciphertext, tag = encrypt_data(chunk, session_keys[task_id])
+                    f.write(iv + tag + ciphertext)  # Store encrypted data
+                else:
+                    f.write(chunk)  # Fallback to unencrypted
+                    
                 f.flush()  # Ensure data is written to disk
+                bytes_read += len(chunk)
                 progress = min(100, (bytes_read / total_size) * 100)
                 progress_tracker[task_id]["progress"] = progress
                 progress_tracker[task_id]["message"] = f"Uploaded {bytes_read} of {total_size} bytes"
@@ -177,45 +260,6 @@ async def upload_file(file: UploadFile = File(...), task_id: str = Form(...)):
         if task_id in cancel_events:
             del cancel_events[task_id]
             
-    #         if not progress_tracker[task_id]["canceled"]:
-    #             f.flush()
-    #             os.fsync(f.fileno())
-    #             progress_tracker[task_id]["progress"] = 100
-    #             progress_tracker[task_id]["completed"] = True
-    #             progress_tracker[task_id]["message"] = f"File {file.filename} uploaded successfully"
-    #             logger.info(f"Upload completed for {task_id}")
-    #         else:
-    #             progress_tracker[task_id]["completed"] = True
-    #             progress_tracker[task_id]["message"] = f"Upload canceled for {file.filename}"
-    #             logger.info(f"Upload canceled for {task_id}, file not saved")
-                
-    #     if progress_tracker[task_id]["canceled"]:
-    #         if os.path.exists(filepath):
-    #             try:
-    #                 os.remove(filepath)
-    #                 logger.info(f"Deleted canceled upload file: {filepath}")
-    #             except Exception as cleanup_error:
-    #                 logger.error(f"Failed to delete canceled upload file {filepath}: {str(cleanup_error)}")
-    #         return {"message": f"Upload canceled for {file.filename}", "task_id": task_id}
-    #     return {"message": f"File {file.filename} uploaded successfully", "task_id": task_id}
-    # except Exception as e:
-    #     logger.error(f"Upload failed for {task_id}: {str(e)}")
-    #     progress_tracker[task_id]["message"] = f"Upload failed: {str(e)}"
-    #     progress_tracker[task_id]["completed"] = True
-    #     if os.path.exists(filepath):
-    #         try:
-    #             os.remove(filepath)
-    #             logger.info(f"Deleted partial file: {filepath}")
-    #         except Exception as cleanup_error:
-    #             logger.error(f"Failed to delete partial file {filepath}: {str(cleanup_error)}")
-    #     raise
-    # finally:
-    #     if bytes_read < total_size and os.path.exists(filepath):
-    #         try:
-    #             os.remove(filepath)
-    #             logger.info(f"Deleted partial file after incomplete upload: {filepath}")
-    #         except Exception as cleanup_error:
-    #             logger.error(f"Failed to delete partial file {filepath}: {str(cleanup_error)}")
 
 # Cancel endpoint
 @app.post("/cancel/{task_id}")
@@ -230,14 +274,14 @@ async def cancel_upload(task_id: str):
 
 # Download endpoint (unchanged)
 @app.get("/download/{filename}")
-async def download_file(filename: str):
+async def download_file(filename: str, task_id: str = None):
     filepath = os.path.join(UPLOAD_DIR, filename)
     if not os.path.exists(filepath):
         logger.error(f"File not found: {filename}")
         raise HTTPException(status_code=404, detail="File not found")
         # return {"error": "File not found"}
 
-    task_id = str(uuid.uuid4())
+    task_id = task_id or str(uuid.uuid4())
     file_size = os.path.getsize(filepath)
     bytes_sent = 0
     chunk_size = 1024 * 1024 * 10 #10MB chunks
@@ -247,6 +291,11 @@ async def download_file(filename: str):
         nonlocal bytes_sent
         with open(filepath, "rb") as f:
             while chunk := f.read(chunk_size):
+                
+                if task_id in session_keys:
+                    iv, ciphertext, tag = encrypt_data(chunk, session_keys[task_id])
+                    chunk = iv + tag + ciphertext  # Send encrypted data
+                    
                 bytes_sent += len(chunk)
                 progress = min(100, (bytes_sent / file_size) * 100)
                 progress_tracker[task_id]["progress"] = progress
