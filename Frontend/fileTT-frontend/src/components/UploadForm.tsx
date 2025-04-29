@@ -136,23 +136,35 @@ function UploadForm() {
 
     // Handle cancel upload
     const handleCancel = async () => {
-      if (cancelToken && ws && taskId) {
-        cancelToken.cancel("Upload canceled by user");
-        // Send cancellation signal via WebSocket
-        ws.send(JSON.stringify({ action: "cancel" }));
-        console.log(`Sent WebSocket cancellation for task_id: ${taskId}`);
-
-        setIsUploading(false);
-        setClientProgress(0);
-        setServerProgress(0);
-        setMessage("Upload canceled");
-        ws.close();
-        setWs(null);
-        setCancelToken(null);
-        setTaskId(null);
-        console.log("Cancel requested");
+      if (cancelToken) {
+          cancelToken.cancel("Upload canceled by user");
+          setMessage("Upload canceled");
+          setIsUploading(false);
+          setClientProgress(0);
+          setServerProgress(0);
       }
-    };
+      if (ws && taskId) {
+          try {
+              ws.send(JSON.stringify({ action: "cancel", task_id: taskId }));
+              console.log(`Sent cancellation request for task_id: ${taskId}`);
+          } catch (error) {
+            console.log(`Failed to send WebSocket cancel: ${error}`);
+          } finally {
+              ws.close();
+              setWs(null);
+          }
+      }
+      if (taskId) {
+          try {
+              await axios.post(`http://localhost:8000/cancel/${taskId}`);
+              console.log(`Sent HTTP cancellation request for task_id: ${taskId}`);
+          } catch (error) {
+            console.log(`Failed to send HTTP cancel: ${error}`);
+          }
+      }
+      setCancelToken(null);
+      setTaskId(null);
+  };
 
   return (
     <div className="flex flex-col gap-4 items-center justify-center h-screen">

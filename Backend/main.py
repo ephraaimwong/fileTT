@@ -13,16 +13,16 @@ import logging
 from contextlib import asynccontextmanager
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 import base64
-
+from starlette.websockets import WebSocketState
 
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+# logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)  # Change from logging.INFO
 logger = logging.getLogger(__name__)
-import receive
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from spake2 import SPAKE2_A
-from websocket import send
+# import receive
+
+# from websocket import send
 app = FastAPI()
 
 app.add_middleware(
@@ -117,12 +117,16 @@ async def websocket_progress(websocket: WebSocket, task_id: str):
             
             #check for cancellation requests from the client
             try:
-                message = await asyncio.wait_for(websocket.receive_json(), timeout=1.0)
+                message = await asyncio.wait_for(websocket.receive_json(), timeout=0.5)
                 if message.get("action") == "cancel":
                     progress_tracker[task_id]["canceled"] = True
+                    
+                    if task_id not in cancel_events:
+                        cancel_events[task_id] = asyncio.Event()
+                        
                     cancel_events[task_id].set()
                     progress_tracker[task_id]["message"] = "Upload canceled by client"
-                    logger.info(f"Cancellation request for task:{task_id} received")
+                    logger.info(f"Cancellation request for task:{task_id} received via WebSocket")
                 elif message.get("action") == "upload_chunk":
                     # Handle encrypted file chunk
                     iv = base64.b64decode(message["iv"])
@@ -146,7 +150,8 @@ async def websocket_progress(websocket: WebSocket, task_id: str):
         progress_tracker[task_id]["message"] = f"WebSocket error: {str(e)}"
     finally:
         websocket_clients[task_id].remove(websocket)
-        await websocket.close()
+        if websocket.application_state == WebSocketState.CONNECTED:
+            await websocket.close()
         logger.info(f"WebSocket closed for {task_id}, clients: {len(websocket_clients[task_id])}")
         if not websocket_clients[task_id]:
             del websocket_clients[task_id]
@@ -157,18 +162,20 @@ async def websocket_progress(websocket: WebSocket, task_id: str):
 
 # Context manager for file handling
 @asynccontextmanager
-async def file_writer(filepath: str):
+async def file_writer(filepath: str, task_id: str):
     f = open(filepath, "wb")
     try:
         yield f
     finally:
         f.close()
-        if os.path.exists(filepath):
+        if os.path.exists(filepath) and (progress_tracker[task_id]["canceled"] or not progress_tracker[task_id]["completed"]):
             try:
                 os.remove(filepath)
                 logger.info(f"Deleted partial file: {filepath}")
             except Exception as e:
                 logger.error(f"Failed to delete partial file {filepath}: {str(e)}")
+        elif os.path.exists(filepath):
+            logger.info(f"File {filepath} uploaded successfully")
 
 # Upload endpoint with client-provided task_id
 @app.post("/upload/")#TODO, encrypt file transfers, TODO setup websocket server to serve this over instead of using psot
@@ -178,7 +185,7 @@ async def upload_file(file: UploadFile = File(...), task_id: str = Form(...)):
     
     filepath = os.path.join(UPLOAD_DIR, file.filename)
     total_size = file.size or 1
-    chunk_size = 1024 * 1024 *10  # 10mb chunks
+    chunk_size = 1024 * 1024  # 1mb chunks for cancellation responsiveness
     bytes_read = 0
 
     logger.info(f"Starting upload for {file.filename}, task_id: {task_id}, size: {total_size}")
@@ -186,7 +193,8 @@ async def upload_file(file: UploadFile = File(...), task_id: str = Form(...)):
     async def broadcast_progress():
         while not progress_tracker[task_id]["completed"] and not progress_tracker[task_id]["canceled"]:
             if websocket_clients[task_id]:
-                logger.debug(f"Broadcasting progress for {task_id}: {progress_tracker[task_id]}")
+                # logger.debug(f"Broadcasting progress for {task_id}: {progress_tracker[task_id]}")
+                logger.info(f"Broadcasting progress for {task_id}: {progress_tracker[task_id]}")  # Change from logger.debug
                 for ws in websocket_clients[task_id]:
                     try:
                         await ws.send_json(progress_tracker[task_id])
@@ -197,26 +205,36 @@ async def upload_file(file: UploadFile = File(...), task_id: str = Form(...)):
     asyncio.create_task(broadcast_progress())
 
     try:
-        async with file_writer(filepath) as f:
+        async with file_writer(filepath, task_id) as f:
             while True:
                 # Check cancellation before reading
                 if cancel_events[task_id].is_set():
                     logger.info(f"Upload canceled for {task_id}, stopping file write")
-                    progress_tracker[task_id]["completed"] = True
+                    # progress_tracker[task_id]["completed"] = True
                     progress_tracker[task_id]["canceled"] = True
                     progress_tracker[task_id]["message"] = "Upload canceled"
                     await file.close()  # Close the file stream to stop reading
                     return {"message": f"Upload canceled for {file.filename}", "task_id": task_id}
 
-                # Read a small chunk
-                chunk = await file.read(chunk_size)
+                # Read chunk with timeout to allow cancellation checks
+                try:
+                    chunk = await asyncio.wait_for(file.read(chunk_size), timeout=0.5)
+                except asyncio.TimeoutError:
+                    if cancel_events[task_id].is_set():
+                        logger.info(f"Upload canceled for {task_id} during read, stopping file write")
+                        progress_tracker[task_id]["canceled"] = True
+                        progress_tracker[task_id]["message"] = "Upload canceled"
+                        await file.close()
+                        return {"message": f"Upload canceled for {file.filename}", "task_id": task_id}
+                    continue
+                
                 if not chunk:  # End of file
                     break
 
                 # Double-check cancellation after read but before write
                 if cancel_events[task_id].is_set():
                     logger.info(f"Upload canceled for {task_id} after read, stopping file write")
-                    progress_tracker[task_id]["completed"] = True
+                    # progress_tracker[task_id]["completed"] = True
                     progress_tracker[task_id]["canceled"] = True
                     progress_tracker[task_id]["message"] = "Upload canceled"
                     await file.close()
@@ -234,13 +252,15 @@ async def upload_file(file: UploadFile = File(...), task_id: str = Form(...)):
                 progress = min(100, (bytes_read / total_size) * 100)
                 progress_tracker[task_id]["progress"] = progress
                 progress_tracker[task_id]["message"] = f"Uploaded {bytes_read} of {total_size} bytes"
-                logger.debug(f"Upload progress for {task_id}: {progress}%")
-                await asyncio.sleep(0.001)  # Minimal yield to event loop
+                # logger.debug(f"Upload progress for {task_id}: {progress}%")
+                logger.info(f"Upload progress for {task_id}: {progress}%")  # Change from logger.debug
+                # await asyncio.sleep(0.001)  # Minimal yield to event loop
+                await asyncio.sleep(0)
 
             # Final cancellation check
             if cancel_events[task_id].is_set():
                 logger.info(f"Upload canceled for {task_id} at end of file")
-                progress_tracker[task_id]["completed"] = True
+                # progress_tracker[task_id]["completed"] = True
                 progress_tracker[task_id]["canceled"] = True
                 progress_tracker[task_id]["message"] = "Upload canceled"
                 await file.close()
@@ -260,16 +280,21 @@ async def upload_file(file: UploadFile = File(...), task_id: str = Form(...)):
         progress_tracker[task_id]["completed"] = True
         await file.close()  # Ensure stream is closed on error
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
-    finally:
-        if task_id in cancel_events:
-            del cancel_events[task_id]
-            
+    finally: # In the finally block, only delete cancel_events if canceled or completed
+        if progress_tracker[task_id]["canceled"] or progress_tracker[task_id]["completed"]:
+            if task_id in cancel_events:
+                del cancel_events[task_id]
+                
 
 # Cancel endpoint
 @app.post("/cancel/{task_id}")
 async def cancel_upload(task_id: str):
     if task_id in progress_tracker:
         progress_tracker[task_id]["canceled"] = True
+        
+        if task_id not in cancel_events:
+            cancel_events[task_id] = asyncio.Event()
+            
         cancel_events[task_id].set()
         progress_tracker[task_id]["message"] = "Upload canceled by client"
         logger.info(f"Cancellation requested for task_id: {task_id} via cancel endpoint")
