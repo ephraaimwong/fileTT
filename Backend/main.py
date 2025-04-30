@@ -20,9 +20,7 @@ from starlette.websockets import WebSocketState
 # logging.basicConfig(level=logging.INFO)
 logging.basicConfig(level=logging.DEBUG)  # Change from logging.INFO
 logger = logging.getLogger(__name__)
-# import receive
 
-# from websocket import send
 app = FastAPI()
 
 app.add_middleware(
@@ -42,6 +40,7 @@ progress_tracker = defaultdict(lambda: {"progress": 0, "message": "Pending", "co
 websocket_clients = defaultdict(list)
 cancel_events = defaultdict(asyncio.Event)
 session_keys = {}  # Store SPAKE2-derived keys per task_id
+client_id_connections = defaultdict(list) # Store client_id to WebSocket connections
 
 # SPAKE2 stuff below
 def hkdf_expand(session_secret_key, info, length=32):
@@ -90,10 +89,10 @@ def decrypt_data(iv, ciphertext, tag, key):
 
 # WebSocket endpoint for progress updates
 @app.websocket("/ws/progress/{task_id}")
-async def websocket_progress(websocket: WebSocket, task_id: str):
+async def websocket_progress(websocket: WebSocket, task_id: str, client_id: str = None):
     await websocket.accept()
     websocket_clients[task_id].append(websocket)
-    logger.info(f"WebSocket connected for task_id: {task_id}, clients: {len(websocket_clients[task_id])}")
+    logger.info(f"WebSocket connected for task_id: {task_id}, client_id: {client_id or 'unknown'}, clients: {len(websocket_clients[task_id])}, ip: {websocket.client.host}:{websocket.client.port}")
     
     # Perform SPAKE2 key exchange
     spake2_a = SPAKE2_A(os.urandom(32))  # Use random password for simplicity
@@ -152,13 +151,78 @@ async def websocket_progress(websocket: WebSocket, task_id: str):
         websocket_clients[task_id].remove(websocket)
         if websocket.application_state == WebSocketState.CONNECTED:
             await websocket.close()
-        logger.info(f"WebSocket closed for {task_id}, clients: {len(websocket_clients[task_id])}")
+        logger.info(f"WebSocket closed for {task_id}, client_id:{client_id or 'unknown'}, clients: {len(websocket_clients[task_id])}")
         if not websocket_clients[task_id]:
             del websocket_clients[task_id]
             if progress_tracker[task_id]["canceled"] or progress_tracker[task_id]["completed"]:
                 del progress_tracker[task_id]
                 if task_id in cancel_events:
                     del cancel_events[task_id]
+                if task_id in session_keys:
+                    del session_keys[task_id]
+
+# WebSocket endpoint for notifications
+@app.websocket("/ws/notifications")
+async def websocket_notifications(websocket: WebSocket, client_id: str = None):
+    try:
+        if client_id and len(client_id_connections[client_id]) > 0:
+            logger.warning(f"Client {client_id} already connected to /ws/notifications, rejecting new connection from {websocket.client.host}:{websocket.client.port}")
+            await websocket.close(code=1008, reason="Only one connection per client allowed")
+            return
+
+        await websocket.accept()
+        logger.info(f"WebSocket handshake completed for notifications, client_id: {client_id or 'unknown'}, ip: {websocket.client.host}:{websocket.client.port}")
+        if "notifications" not in websocket_clients:
+            websocket_clients["notifications"] = []
+        websocket_clients["notifications"].append(websocket)
+        if client_id:
+            client_id_connections[client_id].append(websocket)
+        logger.info(f"WebSocket connected for notifications, client_id: {client_id or 'unknown'}, clients: {len(websocket_clients['notifications'])}")
+        try:
+            while True:
+                try:
+                    await websocket.send_json({"action": "ping"})
+                    logger.debug(f"Sent ping to notifications client, client_id: {client_id or 'unknown'}")
+                except Exception as e:
+                    logger.error(f"Failed to send ping for client_id: {client_id or 'unknown'}: {str(e)}")
+                    break
+                try:
+                    await asyncio.wait_for(websocket.receive_json(), timeout=60)
+                except asyncio.TimeoutError:
+                    logger.info(f"Closing inactive WebSocket for client_id: {client_id or 'unknown'} due to timeout")
+                    break
+        except Exception as e:
+            logger.error(f"WebSocket error for notifications, client_id: {client_id or 'unknown'}: {str(e)}")
+    except Exception as e:
+        logger.error(f"WebSocket handshake failed for notifications, client_id: {client_id or 'unknown'}: {str(e)}")
+    finally:
+        if websocket in websocket_clients["notifications"]:
+            websocket_clients["notifications"].remove(websocket)
+        if client_id and websocket in client_id_connections[client_id]:
+            client_id_connections[client_id].remove(websocket)
+            if not client_id_connections[client_id]:
+                del client_id_connections[client_id]
+        if websocket.application_state == WebSocketState.CONNECTED:
+            await websocket.close()
+        logger.info(f"WebSocket closed for notifications, client_id: {client_id or 'unknown'}, clients: {len(websocket_clients['notifications'])}")
+
+# Broadcast upload completion
+async def broadcast_upload_complete(task_id: str, filename: str):
+    logger.info(f"Preparing to broadcast upload_complete for {filename}, task_id: {task_id}")
+    if "notifications" in websocket_clients and websocket_clients["notifications"]:
+        logger.info(f"Broadcasting to {len(websocket_clients['notifications'])} notification clients")
+        for ws in websocket_clients["notifications"]:
+            try:
+                await ws.send_json({
+                    "action": "upload_complete",
+                    "filename": filename,
+                    "task_id": task_id
+                })
+                logger.info(f"Successfully broadcasted upload_complete for {filename}, task_id: {task_id} to client")
+            except Exception as e:
+                logger.error(f"Failed to broadcast to client for {filename}, task_id: {task_id}: {str(e)}")
+    else:
+        logger.warning("No notification clients connected to broadcast upload_complete")
 
 # Context manager for file handling
 @asynccontextmanager
@@ -255,7 +319,7 @@ async def upload_file(file: UploadFile = File(...), task_id: str = Form(...)):
                 # logger.debug(f"Upload progress for {task_id}: {progress}%")
                 logger.info(f"Upload progress for {task_id}: {progress}%")  # Change from logger.debug
                 # await asyncio.sleep(0.001)  # Minimal yield to event loop
-                await asyncio.sleep(0)
+                # await asyncio.sleep(0)
 
             # Final cancellation check
             if cancel_events[task_id].is_set():
@@ -272,6 +336,11 @@ async def upload_file(file: UploadFile = File(...), task_id: str = Form(...)):
             progress_tracker[task_id]["completed"] = True
             progress_tracker[task_id]["message"] = f"File {file.filename} uploaded successfully"
             logger.info(f"Upload completed for {task_id}")
+            
+            # --- AUTO-FETCH CHANGE ---
+            if progress_tracker[task_id]["completed"] and not progress_tracker[task_id]["canceled"]:
+                await broadcast_upload_complete(task_id, file.filename)
+            # --- AUTO-FETCH CHANGE END ---
             return {"message": f"File {file.filename} uploaded successfully", "task_id": task_id}
 
     except Exception as e:

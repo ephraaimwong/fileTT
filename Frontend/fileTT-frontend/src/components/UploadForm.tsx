@@ -1,4 +1,4 @@
-import { useState, ChangeEvent, useEffect } from "react";
+import { useState, ChangeEvent, useEffect, useRef } from "react";
 import axios, {CancelTokenSource} from "axios";
 
 
@@ -11,6 +11,7 @@ function UploadForm() {
   const [isUploading, setIsUploading] = useState<boolean>(false);
   const [cancelToken, setCancelToken] = useState<CancelTokenSource | null>(null);
   const [taskId, setTaskId] = useState<string | null>(null); // Track taskId
+  const clientId = useRef(`client-${Math.random().toString(36).substring(2, 9)}`).current;
 
   // Debounce progress updates
   useEffect(()=>{
@@ -32,17 +33,17 @@ function UploadForm() {
       setServerProgress(0);
       setMessage("");
       setIsUploading(false);
-      console.log("Selected file:", e.target.files[0].name);
+      console.log(`[${clientId}] Selected file: ${e.target.files[0].name}`);
     }
   };
 
   //connect to websocket server to track server-side progress update
   const connectWebSocket = (taskId: string) => {
-    console.log(`Connecting WebSocket for task_id: ${taskId}`);
-    const websocket = new WebSocket(`ws://localhost:8000/ws/progress/${taskId}`);
+    console.log(`[${clientId}] Connecting WebSocket for task_id: ${taskId}`);
+    const websocket = new WebSocket(`ws://localhost:8000/ws/progress/${taskId}?client_id=${clientId}`);
     websocket.onopen = () => {
       setMessage(`Tracking Server-sideProgress for upload`);
-      console.log(`WebSocket opened for task_id: ${taskId} at ${new Date().toISOString()}`);
+      console.log(`[${clientId}] WebSocket opened for task_id: ${taskId} at ${new Date().toISOString()}`);
     }
     websocket.onmessage = (event) => {
       const data = JSON.parse(event.data);
@@ -51,15 +52,15 @@ function UploadForm() {
       if (data.canceled || data.completed) {
         setIsUploading(false); // Stop upload UI when server confirms cancellation
       }    
-      console.log(`WebSocket message for ${taskId} at ${new Date().toISOString()}:`, data);
+      console.log(`[${clientId}] WebSocket message for ${taskId} at ${new Date().toISOString()}:`, data);
     };
     websocket.onerror = (error) => {
       setMessage("WebSocket connection failed");
-      console.error(`WebSocket error for ${taskId}:`, error);
+      console.error(`[${clientId}] WebSocket error for ${taskId}:`, error);
     };
     websocket.onclose = () => {
       setMessage("Server-side progress tracking complete");
-      console.log(`WebSocket closed for task_id: ${taskId} at ${new Date().toISOString()}`);
+      console.log(`[${clientId}] WebSocket closed for task_id: ${taskId} at ${new Date().toISOString()}`);
     };
     setWs(websocket);
     return websocket;
@@ -70,10 +71,10 @@ function UploadForm() {
     return ()=> {
       if (ws) {
         ws?.close();
-        console.log("WebSocket cleanup on unmount");
+        console.log(`[${clientId}] WebSocket cleanup on unmount`);
       }
     };
-  }, [ws]);
+  }, [ws, clientId]);
 
   //handle file upload
   const handleUpload = async () => {
@@ -99,38 +100,38 @@ function UploadForm() {
     formData.append("task_id", taskId); // Send task_id to backend
 
     try {
-      console.log(`Starting upload for ${file.name} with task_id: ${taskId}`);
+      console.log(`[${clientId}] Starting upload for ${file.name} with task_id: ${taskId}`);
       const response = await axios.post("http://localhost:8000/upload/", formData, {
         headers: {"Content-Type": "multipart/form-data",},
         onUploadProgress: (progressEvent)=>{
           if(progressEvent.total){
             const progress = Math.round((progressEvent.loaded / progressEvent.total)*100);
             setClientProgress(progress);
-            console.log(`Client-side upload progress: ${progress}% at ${new Date().toISOString()}`);
+            console.log(`[${clientId}] Client-side upload progress: ${progress}% at ${new Date().toISOString()}`);
           }
         },
         cancelToken: source.token,
         timeout:0, // Disable Axios timeout for large files
       });
       setMessage(response.data.message);
-      console.log(`Upload response:`, response.data);
-      connectWebSocket(response.data.task_id); // Connect to WebSocket with task ID
+      console.log(`[${clientId}] Upload response:`, response.data);
+      // connectWebSocket(response.data.task_id); // Connect to WebSocket with task ID
     } catch (err: any) {
       if (axios.isCancel(err)) {
         setMessage("Upload canceled");
-        console.log("Upload canceled by user");
+        console.log(`[${clientId}] Upload canceled by user`);
       } else {
-        console.error("Upload error:", err);
+        console.error(`[${clientId}] Upload error:`, err);
         setMessage(`Upload failed: ${err.response?.data?.error || err.message}`);
       }
     } finally {
       setIsUploading(false);
       setCancelToken(null);
       setTaskId(null); // Reset task_id
-      if (websocket) {
-        websocket.close();
-        setWs(null);
-      }
+      // if (websocket) {
+      //   websocket.close();
+      //   setWs(null);
+      // }
     }
   };
 
@@ -146,9 +147,9 @@ function UploadForm() {
       if (ws && taskId) {
           try {
               ws.send(JSON.stringify({ action: "cancel", task_id: taskId }));
-              console.log(`Sent cancellation request for task_id: ${taskId}`);
+              console.log(`[${clientId}] Sent cancellation request for task_id: ${taskId}`);
           } catch (error) {
-            console.log(`Failed to send WebSocket cancel: ${error}`);
+            console.log(`[${clientId}] Failed to send WebSocket cancel: ${error}`);
           } finally {
               ws.close();
               setWs(null);
@@ -157,9 +158,9 @@ function UploadForm() {
       if (taskId) {
           try {
               await axios.post(`http://localhost:8000/cancel/${taskId}`);
-              console.log(`Sent HTTP cancellation request for task_id: ${taskId}`);
+              console.log(`[${clientId}] Sent HTTP cancellation request for task_id: ${taskId}`);
           } catch (error) {
-            console.log(`Failed to send HTTP cancel: ${error}`);
+            console.log(`[${clientId}] Failed to send HTTP cancel: ${error}`);
           }
       }
       setCancelToken(null);
