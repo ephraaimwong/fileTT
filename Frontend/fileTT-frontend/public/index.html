@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FileTT - Connected Users</title>
+    <link rel="icon" type="image/svg+xml" href="/vite.svg">
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background-color: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+            padding: 20px;
+            margin-top: 20px;
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+        }
+        .status-indicator {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            margin-right: 8px;
+        }
+        .status-connected {
+            background-color: #4CAF50;
+        }
+        .status-disconnected {
+            background-color: #F44336;
+        }
+        .connection-status {
+            text-align: center;
+            margin-bottom: 20px;
+            padding: 10px;
+            border-radius: 4px;
+        }
+        .connected {
+            background-color: #E8F5E9;
+            color: #2E7D32;
+        }
+        .disconnected {
+            background-color: #FFEBEE;
+            color: #C62828;
+        }
+        .user-list {
+            list-style-type: none;
+            padding: 0;
+        }
+        .user-item {
+            padding: 10px 15px;
+            margin-bottom: 8px;
+            border-radius: 4px;
+            background-color: #E3F2FD;
+            display: flex;
+            align-items: center;
+        }
+        .current-user {
+            background-color: #E8F5E9;
+            font-weight: bold;
+        }
+        .user-badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 12px;
+            font-size: 12px;
+            margin-left: 8px;
+            background-color: #2196F3;
+            color: white;
+        }
+        .user-connection-container {
+            margin: 20px 0;
+            padding: 15px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            background-color: white;
+        }
+        .user-box {
+            padding: 10px;
+            border-radius: 8px;
+            text-align: center;
+            width: 25%;
+        }
+        .sender-box {
+            background-color: #E3F2FD;
+        }
+        .receiver-box {
+            background-color: #F3E5F5;
+        }
+        .connection-container {
+            flex: 1;
+            margin: 0 15px;
+            position: relative;
+        }
+        .connection-line {
+            height: 2px;
+            width: 100%;
+            position: absolute;
+            top: 50%;
+        }
+        .connection-status-text {
+            text-align: center;
+            margin-top: 15px;
+            font-size: 14px;
+        }
+        .main-app-link {
+            display: block;
+            text-align: center;
+            margin-top: 20px;
+            padding: 10px;
+            background-color: #2196F3;
+            color: white;
+            text-decoration: none;
+            border-radius: 4px;
+            font-weight: bold;
+        }
+        .main-app-link:hover {
+            background-color: #1976D2;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>FileTT - Connected Users</h1>
+        
+        <div id="connectionStatus" class="connection-status disconnected">
+            <span class="status-indicator status-disconnected"></span>
+            Connecting to server...
+        </div>
+        
+        <div id="userConnectionVisualizer" class="user-connection-container" style="display: none;">
+            <h3 style="text-align: center; margin-bottom: 15px;">User Connection Visualization</h3>
+            
+            <div style="display: flex; align-items: center; justify-content: space-between;">
+                <!-- Current User -->
+                <div class="user-box sender-box">
+                    <div style="margin-bottom: 10px;">
+                        <svg width="40" height="40" viewBox="0 0 20 20" fill="#1E88E5">
+                            <path fill-rule="evenodd" d="M10 9a3 3 0 100-6 3 3 0 000 6zm-7 9a7 7 0 1114 0H3z" clip-rule="evenodd" />
+                        </svg>
+                    </div>
+                    <div id="currentUserName" style="font-weight: bold;">You</div>
+                </div>
+                
+                <!-- Connection visualization -->
+                <div class="connection-container">
+                    <div id="connectionLine" class="connection-line" style="background-color: #ccc;"></div>
+                    <div id="connectionStatusText" class="connection-status-text">Waiting for connection...</div>
+                </div>
+                
+                <!-- Other Users -->
+                <div class="user-box receiver-box">
+                    <div style="margin-bottom: 10px;">
+                        <svg width="40" height="40" viewBox="0 0 20 20" fill="#7B1FA2">
+                            <path fill-rule="evenodd" d="M10 9a3 3 0 100-6 3 3 0 000 6zm-7 9a7 7 0 1114 0H3z" clip-rule="evenodd" />
+                        </svg>
+                    </div>
+                    <div id="otherUsersCount">0 other users</div>
+                </div>
+            </div>
+        </div>
+        
+        <h3>Currently Connected Users</h3>
+        <ul id="userList" class="user-list">
+            <li class="user-item">Loading users...</li>
+        </ul>
+        
+        <a href="/" class="main-app-link">Go to Main Application</a>
+    </div>
+
+    <script>
+        // Get or create a persistent client ID using localStorage
+        const getClientId = () => {
+            let clientId = localStorage.getItem('clientId');
+            if (!clientId) {
+                clientId = `client-${Math.random().toString(36).substring(2, 9)}`;
+                localStorage.setItem('clientId', clientId);
+            }
+            return clientId;
+        };
+        
+        const clientId = getClientId();
+        let notificationWs = null;
+        let connectedUsers = [];
+        let isConnected = false;
+        
+        // Update the UI with connection status
+        const updateConnectionStatus = (connected) => {
+            const statusElement = document.getElementById('connectionStatus');
+            const statusIndicator = statusElement.querySelector('.status-indicator');
+            
+            isConnected = connected;
+            
+            if (connected) {
+                statusElement.className = 'connection-status connected';
+                statusElement.innerHTML = `
+                    <span class="status-indicator status-connected"></span>
+                    Connected to server
+                `;
+                
+                // Update connection visualizer
+                document.getElementById('connectionLine').style.backgroundColor = '#4CAF50';
+                document.getElementById('userConnectionVisualizer').style.display = 'block';
+            } else {
+                statusElement.className = 'connection-status disconnected';
+                statusElement.innerHTML = `
+                    <span class="status-indicator status-disconnected"></span>
+                    Disconnected from server
+                `;
+                
+                // Update connection visualizer
+                document.getElementById('connectionLine').style.backgroundColor = '#ccc';
+            }
+            
+            // Update current user display
+            document.getElementById('currentUserName').textContent = `You (${clientId})`;
+        };
+        
+        // Update the user list in the UI
+        const updateUserList = () => {
+            const userListElement = document.getElementById('userList');
+            userListElement.innerHTML = '';
+            
+            // Add current user first
+            const currentUserItem = document.createElement('li');
+            currentUserItem.className = 'user-item current-user';
+            currentUserItem.innerHTML = `
+                <span class="status-indicator status-connected"></span>
+                You (${clientId})
+                <span class="user-badge">You</span>
+            `;
+            userListElement.appendChild(currentUserItem);
+            
+            // Add other connected users
+            if (connectedUsers.length > 0) {
+                connectedUsers.forEach(userId => {
+                    const userItem = document.createElement('li');
+                    userItem.className = 'user-item';
+                    userItem.innerHTML = `
+                        <span class="status-indicator status-connected"></span>
+                        ${userId}
+                    `;
+                    userListElement.appendChild(userItem);
+                });
+            } else if (isConnected) {
+                const noUsersItem = document.createElement('li');
+                noUsersItem.className = 'user-item';
+                noUsersItem.textContent = 'No other users connected';
+                userListElement.appendChild(noUsersItem);
+            }
+            
+            // Update the connection visualizer
+            document.getElementById('otherUsersCount').textContent = 
+                connectedUsers.length === 1 
+                    ? '1 other user' 
+                    : `${connectedUsers.length} other users`;
+                    
+            document.getElementById('connectionStatusText').textContent = 
+                connectedUsers.length > 0 
+                    ? 'Connected' 
+                    : 'No other users connected';
+        };
+        
+        // Connect to the notification WebSocket
+        const connectNotificationWs = () => {
+            notificationWs = new WebSocket(`ws://localhost:8000/ws/notifications?client_id=${clientId}`);
+            
+            notificationWs.onopen = () => {
+                console.log(`[${clientId}] Notification WebSocket connected`);
+                updateConnectionStatus(true);
+            };
+            
+            notificationWs.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                
+                if (data.action === "user_connected") {
+                    console.log(`[${clientId}] User connected: ${data.client_id}`);
+                    if (!connectedUsers.includes(data.client_id)) {
+                        connectedUsers.push(data.client_id);
+                        updateUserList();
+                    }
+                } else if (data.action === "user_disconnected") {
+                    console.log(`[${clientId}] User disconnected: ${data.client_id}`);
+                    connectedUsers = connectedUsers.filter(id => id !== data.client_id);
+                    updateUserList();
+                } else if (data.action === "connected_users") {
+                    console.log(`[${clientId}] Connected users:`, data.client_ids);
+                    connectedUsers = data.client_ids || [];
+                    updateUserList();
+                } else if (data.action === "ping") {
+                    // Keep-alive ping
+                    console.log(`[${clientId}] Received ping from server`);
+                }
+            };
+            
+            notificationWs.onerror = (error) => {
+                console.error(`[${clientId}] Notification WebSocket error:`, error);
+                updateConnectionStatus(false);
+            };
+            
+            notificationWs.onclose = () => {
+                console.log(`[${clientId}] Notification WebSocket closed`);
+                updateConnectionStatus(false);
+                
+                // Try to reconnect after a delay
+                setTimeout(() => {
+                    if (document.visibilityState !== 'hidden') {
+                        connectNotificationWs();
+                    }
+                }, 3000);
+            };
+        };
+        
+        // Handle page visibility changes
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible') {
+                // If the page becomes visible and we're not connected, try to reconnect
+                if (notificationWs === null || notificationWs.readyState !== WebSocket.OPEN) {
+                    connectNotificationWs();
+                }
+            }
+        });
+        
+        // Handle beforeunload to properly close the WebSocket
+        window.addEventListener('beforeunload', () => {
+            if (notificationWs && notificationWs.readyState === WebSocket.OPEN) {
+                notificationWs.close();
+            }
+        });
+        
+        // Initialize the connection
+        connectNotificationWs();
+        updateUserList();
+    </script>
+</body>
+</html>

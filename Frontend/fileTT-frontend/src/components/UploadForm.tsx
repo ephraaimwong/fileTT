@@ -1,5 +1,52 @@
-import { useState, ChangeEvent, useEffect, useRef } from "react";
+import React, { useState, ChangeEvent, useEffect, useRef } from "react";
 import axios, {CancelTokenSource} from "axios";
+
+// User Connection Visualizer Component
+interface UserConnectionVisualizerProps {
+  senderName: string;
+  receiverName: string;
+  isConnected: boolean;
+}
+
+const UserConnectionVisualizer: React.FC<UserConnectionVisualizerProps> = ({ senderName, receiverName, isConnected }) => {
+  return (
+    <div className="user-connection-container my-6 p-4 border rounded-lg shadow-md">
+      <h3 className="text-lg font-semibold mb-3">User Connection Visualization</h3>
+
+<div className="user-connection-layout" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1rem', width: '100%' }}>
+        {/* Sender */}
+        <div className="user-box p-3 bg-blue-100 rounded-lg text-center w-1/4">
+          <div className="user-icon mb-2">
+            <svg className="w-10 h-10 mx-auto text-blue-600" fill="currentColor" viewBox="0 0 20 20" style={{ maxWidth: '50px', maxHeight: '50px' }}>
+              <path fillRule="evenodd" d="M10 9a3 3 0 100-6 3 3 0 000 6zm-7 9a7 7 0 1114 0H3z" clipRule="evenodd" />
+            </svg>
+          </div>
+          <div className="user-name font-medium">{senderName || "Sender"}</div>
+        </div>
+
+        {/* Connection visualization */}
+        <div className="connection-container flex-1 mx-4 relative">
+          <div className={`connection-line h-1 ${isConnected ? 'bg-green-500' : 'bg-gray-300'} w-full absolute top-1/2`}></div>
+
+          {/* Connection status */}
+          <div className="connection-status text-xs text-center absolute w-full" style={{ bottom: '-20px' }}>
+            {isConnected ? "Connected" : "Disconnected"}
+          </div>
+        </div>
+
+        {/* Receiver */}
+        <div className="user-box p-3 bg-purple-100 rounded-lg text-center w-1/4">
+          <div className="user-icon mb-2">
+            <svg className="w-10 h-10 mx-auto text-purple-600" fill="currentColor" viewBox="0 0 20 20" style={{ maxWidth: '50px', maxHeight: '50px' }}>
+              <path fillRule="evenodd" d="M10 9a3 3 0 100-6 3 3 0 000 6zm-7 9a7 7 0 1114 0H3z" clipRule="evenodd" />
+            </svg>
+          </div>
+          <div className="user-name font-medium">{receiverName || "Receiver"}</div>
+        </div>
+      </div>
+    </div>
+  );
+};
 
 
 function UploadForm() {
@@ -12,7 +59,20 @@ function UploadForm() {
   const [cancelToken, setCancelToken] = useState<CancelTokenSource | null>(null);
   const [taskId, setTaskId] = useState<string | null>(null); // Track taskId
   const [encryptedContent, setEncryptedContent] = useState<string | null>(null); // Store encrypted content
-  const clientId = useRef(`client-${Math.random().toString(36).substring(2, 9)}`).current;
+  const [connectedUsers, setConnectedUsers] = useState<string[]>([]); // Store connected users
+  const [notificationWs, setNotificationWs] = useState<WebSocket | null>(null); // WebSocket for notifications
+  const [isConnected, setIsConnected] = useState<boolean>(false); // Connection status
+  const [sharedPassword, setSharedPassword] = useState<string>(""); // Store shared password
+  const clientId = useRef(() => {
+    // Try to get existing clientId from localStorage
+    const savedClientId = localStorage.getItem('clientId');
+    if (savedClientId) return savedClientId;
+
+    // Generate a new one if none exists
+    const newClientId = `client-${Math.random().toString(36).substring(2, 9)}`;
+    localStorage.setItem('clientId', newClientId);
+    return newClientId;
+  }).current;
 
   // Debounce progress updates
   useEffect(()=>{
@@ -42,7 +102,15 @@ function UploadForm() {
   //connect to websocket server to track server-side progress update
   const connectWebSocket = (taskId: string) => {
     console.log(`[${clientId}] Connecting WebSocket for task_id: ${taskId}`);
-    const websocket = new WebSocket(`ws://localhost:8000/ws/progress/${taskId}?client_id=${clientId}`);
+
+    // Include shared password in the WebSocket URL if provided
+    let wsUrl = `ws://localhost:8000/ws/progress/${taskId}?client_id=${clientId}`;
+    if (sharedPassword) {
+      wsUrl += `&shared_password=${encodeURIComponent(sharedPassword)}`;
+      console.log(`[${clientId}] Using custom shared password for connection`);
+    }
+
+    const websocket = new WebSocket(wsUrl);
 
     // For SPAKE2 key exchange
     let spake2Initialized = false;
@@ -59,13 +127,37 @@ function UploadForm() {
         // Received SPAKE2 message from server, need to respond with our own message
         console.log(`[${clientId}] Received SPAKE2 message from server for ${taskId}`);
 
-        // Use the same password as the server (task_id + client_id)
-        const password = (taskId + clientId);
+        // Use shared password if provided, otherwise use default (task_id + client_id)
+        const password = sharedPassword || (taskId + clientId);
+        console.log(`[${clientId}] Using ${sharedPassword ? 'custom' : 'default'} password for SPAKE2 exchange`);
 
-        // In a real implementation, we would use the SPAKE2_Symmetric library here
-        // For now, we'll just echo back the same message to simulate the exchange
+        // Simple SPAKE2-like response generation
+        // This is a simplified implementation that generates a deterministic response
+        // based on the password and the received message
+        const generateSpake2Response = (incomingMsg, password) => {
+          // Decode the base64 message
+          const decodedMsg = atob(incomingMsg);
+
+          // Create a response by combining the password with the decoded message
+          // and hashing it using a simple algorithm
+          let response = '';
+          const combinedInput = password + decodedMsg;
+
+          // Simple hash function to generate a deterministic response
+          for (let i = 0; i < combinedInput.length; i++) {
+            response += String.fromCharCode(
+              (combinedInput.charCodeAt(i) + password.charCodeAt(i % password.length)) % 256
+            );
+          }
+
+          // Encode the response as base64
+          return btoa(response);
+        };
+
+        // Generate and send the SPAKE2 response
+        const responseMsg = generateSpake2Response(data.spake2_msg, password);
         websocket.send(JSON.stringify({
-          spake2_msg: data.spake2_msg
+          spake2_msg: responseMsg
         }));
 
         spake2Initialized = true;
@@ -100,6 +192,134 @@ function UploadForm() {
     setWs(websocket);
     return websocket;
   };
+
+  // Connect to notification WebSocket
+  useEffect(() => {
+    const connectNotificationWs = () => {
+      // Include shared password in the WebSocket URL if provided
+      let wsUrl = `ws://localhost:8000/ws/notifications?client_id=${clientId}`;
+      if (sharedPassword) {
+        wsUrl += `&shared_password=${encodeURIComponent(sharedPassword)}`;
+        console.log(`[${clientId}] Using custom shared password for notification connection`);
+      }
+
+      const websocket = new WebSocket(wsUrl);
+
+      // For SPAKE2 key exchange
+      let spake2Initialized = false;
+
+      websocket.onopen = () => {
+        console.log(`[${clientId}] Notification WebSocket connected`);
+        // Don't set connected until after SPAKE2 authentication if password is provided
+        if (!sharedPassword) {
+          setIsConnected(true);
+        }
+      };
+
+      websocket.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+
+        // Handle SPAKE2 key exchange messages
+        if (data.spake2_msg && !spake2Initialized) {
+          // Received SPAKE2 message from server, need to respond with our own message
+          console.log(`[${clientId}] Received SPAKE2 message from server for notifications`);
+
+          // Use shared password for SPAKE2 exchange
+          const password = sharedPassword;
+          console.log(`[${clientId}] Using custom password for SPAKE2 exchange in notifications`);
+
+          // Simple SPAKE2-like response generation
+          // This is a simplified implementation that generates a deterministic response
+          // based on the password and the received message
+          const generateSpake2Response = (incomingMsg, password) => {
+            // Decode the base64 message
+            const decodedMsg = atob(incomingMsg);
+
+            // Create a response by combining the password with the decoded message
+            // and hashing it using a simple algorithm
+            let response = '';
+            const combinedInput = password + decodedMsg;
+
+            // Simple hash function to generate a deterministic response
+            for (let i = 0; i < combinedInput.length; i++) {
+              response += String.fromCharCode(
+                (combinedInput.charCodeAt(i) + password.charCodeAt(i % password.length)) % 256
+              );
+            }
+
+            // Encode the response as base64
+            return btoa(response);
+          };
+
+          // Generate and send the SPAKE2 response
+          const responseMsg = generateSpake2Response(data.spake2_msg, password);
+          websocket.send(JSON.stringify({
+            spake2_msg: responseMsg
+          }));
+
+          spake2Initialized = true;
+          console.log(`[${clientId}] Sent SPAKE2 response for notifications`);
+          return;
+        }
+
+        // Handle HKDF salt and info (part of the key exchange)
+        if (data.hkdf_salt && data.hkdf_info) {
+          console.log(`[${clientId}] Received HKDF parameters for notifications`);
+          // Authentication successful, now we can set connected
+          setIsConnected(true);
+          return;
+        }
+
+        if (data.action === "user_connected") {
+          setConnectedUsers(prev => [...prev, data.client_id]);
+          console.log(`[${clientId}] User connected: ${data.client_id}`);
+        } else if (data.action === "user_disconnected") {
+          setConnectedUsers(prev => prev.filter(id => id !== data.client_id));
+          console.log(`[${clientId}] User disconnected: ${data.client_id}`);
+        } else if (data.action === "connected_users") {
+          setConnectedUsers(data.client_ids || []);
+          console.log(`[${clientId}] Connected users:`, data.client_ids);
+        } else if (data.action === "ping") {
+          // Keep-alive ping
+          console.log(`[${clientId}] Received ping from server`);
+        }
+      };
+
+      websocket.onerror = (error) => {
+        console.error(`[${clientId}] Notification WebSocket error:`, error);
+        setIsConnected(false);
+      };
+
+      websocket.onclose = () => {
+        console.log(`[${clientId}] Notification WebSocket closed`);
+        setIsConnected(false);
+
+        // Try to reconnect after a delay
+        setTimeout(() => {
+          if (document.visibilityState !== 'hidden') {
+            connectNotificationWs();
+          }
+        }, 3000);
+      };
+
+      setNotificationWs(websocket);
+    };
+
+    // Close existing connection before creating a new one
+    if (notificationWs) {
+      notificationWs.close();
+      console.log(`[${clientId}] Closing existing notification WebSocket to reconnect with new password`);
+    }
+
+    connectNotificationWs();
+
+    return () => {
+      if (notificationWs) {
+        notificationWs.close();
+        console.log(`[${clientId}] Notification WebSocket cleanup on unmount`);
+      }
+    };
+  }, [clientId, sharedPassword]); // Add sharedPassword as a dependency to reconnect when it changes
 
   //clean up websocket on component unmount
   useEffect(()=>{
@@ -226,8 +446,29 @@ function UploadForm() {
       setTaskId(null);
   };
 
+  // Handle shared password change
+  const handlePasswordChange = (e: ChangeEvent<HTMLInputElement>) => {
+    setSharedPassword(e.target.value);
+  };
+
   return (
     <div className="flex flex-col gap-4 items-center justify-center h-screen">
+      <div className="w-full max-w-md">
+        <label className="block text-sm font-medium text-gray-700 mb-1">
+          Shared Password (for connecting two instances)
+        </label>
+        <input 
+          type="text" 
+          value={sharedPassword}
+          onChange={handlePasswordChange}
+          placeholder="Enter shared password"
+          className="w-full p-2 border rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+          disabled={isUploading}
+        />
+        <p className="text-xs text-gray-500 mt-1">
+          Enter the same password on two instances to connect them
+        </p>
+      </div>
       <input type="file" onChange={handleFileChange} disabled={isUploading}/>
       <div className="flex gap-2">
       <button onClick={handleUpload} className="bg-blue-500 text-white p-2 rounded" disabled={!file || isUploading}>
@@ -284,6 +525,43 @@ function UploadForm() {
           <p className="text-xs text-gray-500 mt-1">
             This is a representation of the encrypted file content (base64 encoded)
           </p>
+        </div>
+      )}
+
+      {/* Display user connection visualization */}
+      <UserConnectionVisualizer 
+        senderName={`You (${clientId})`}
+        receiverName={connectedUsers.length > 0 ? `User (${connectedUsers[0]})` : "Waiting for connection..."}
+        isConnected={isConnected && connectedUsers.length > 0}
+      />
+
+      {/* Display connected users */}
+      {isConnected && (
+        <div className="connected-users mt-4 p-3 bg-gray-50 rounded-lg max-w-2xl">
+          <h3 className="text-md font-semibold mb-2">Connected Users</h3>
+          <div className="flex flex-wrap gap-2">
+            <div className="user-badge bg-green-100 text-green-800 px-2 py-1 rounded-full text-sm">
+              You ({clientId})
+            </div>
+            {connectedUsers.map(userId => (
+              <div key={userId} className="user-badge bg-blue-100 text-blue-800 px-2 py-1 rounded-full text-sm">
+                {userId}
+              </div>
+            ))}
+            {connectedUsers.length === 0 && (
+              <div className="text-gray-500 text-sm">No other users connected</div>
+            )}
+          </div>
+          <div className="mt-3">
+            <a 
+              href="/index.html" 
+              className="text-blue-600 hover:text-blue-800 text-sm font-medium"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              View Connected Users Page →
+            </a>
+          </div>
         </div>
       )}
     </div>

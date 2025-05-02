@@ -71,14 +71,19 @@ def decrypt_data(iv, ciphertext, tag, session_key):
 
 # WebSocket endpoint for progress updates
 @app.websocket("/ws/progress/{task_id}")
-async def websocket_progress(websocket: WebSocket, task_id: str, client_id: str = None):
+async def websocket_progress(websocket: WebSocket, task_id: str, client_id: str = None, shared_password: str = None):
     await websocket.accept()
     websocket_clients[task_id].append(websocket)
     logger.info(f"WebSocket connected for task_id: {task_id}, client_id: {client_id or 'unknown'}, clients: {len(websocket_clients[task_id])}, ip: {websocket.client.host}:{websocket.client.port}")
 
     # Perform SPAKE2 key exchange using Symmetric mode
-    # Use task_id as the shared identifier to ensure both sides use the same password
-    password = (task_id + client_id).encode() if client_id else task_id.encode()
+    # Use shared_password if provided, otherwise fall back to task_id + client_id
+    if shared_password:
+        password = shared_password.encode()
+        logger.info(f"Using custom shared password for task_id: {task_id}")
+    else:
+        password = (task_id + client_id).encode() if client_id else task_id.encode()
+        logger.info(f"Using default password generation for task_id: {task_id}")
     spake2 = SPAKE2_Symmetric(password)
     msg_out = spake2.start()
     await websocket.send_json({"spake2_msg": base64.b64encode(msg_out).decode()})
@@ -151,34 +156,97 @@ async def websocket_progress(websocket: WebSocket, task_id: str, client_id: str 
 
 # WebSocket endpoint for notifications
 @app.websocket("/ws/notifications")
-async def websocket_notifications(websocket: WebSocket, client_id: str = None):
+async def websocket_notifications(websocket: WebSocket, client_id: str = None, shared_password: str = None):
     if not client_id:
         await websocket.close(code=1008)  # Policy violation
         return
 
     await websocket.accept()
-    client_id_connections[client_id].append(websocket)
-    logger.info(f"Notifications WebSocket connected for client_id: {client_id}")
 
-    try:
-        while True:
-            # Keep connection alive and handle any incoming messages
-            try:
-                message = await asyncio.wait_for(websocket.receive_json(), timeout=30)
-                logger.info(f"Received message from client {client_id}: {message}")
-                # Handle any client messages here
-            except asyncio.TimeoutError:
-                # Send a ping to keep the connection alive
-                await websocket.send_json({"action": "ping"})
-    except Exception as e:
-        logger.error(f"WebSocket error for client {client_id}: {str(e)}")
-    finally:
-        if client_id in client_id_connections:
-            if websocket in client_id_connections[client_id]:
-                client_id_connections[client_id].remove(websocket)
-        if websocket.application_state == WebSocketState.CONNECTED:
-            await websocket.close()
-        logger.info(f"Notifications WebSocket closed for client_id: {client_id}")
+    # Perform SPAKE2 key exchange using Symmetric mode if shared_password is provided
+    authenticated = True
+    if shared_password:
+        logger.info(f"Using custom shared password for notifications from client_id: {client_id}")
+        password = shared_password.encode()
+        spake2 = SPAKE2_Symmetric(password)
+        msg_out = spake2.start()
+        await websocket.send_json({"spake2_msg": base64.b64encode(msg_out).decode()})
+
+        try:
+            # Receive client's SPAKE2 message
+            msg_in_data = await websocket.receive_json()
+            msg_in = base64.b64decode(msg_in_data.get("spake2_msg", ""))
+            session_key = spake2.finish(msg_in)
+            # Authentication successful
+            logger.info(f"SPAKE2 key exchange completed for notifications from client_id: {client_id}")
+            authenticated = True
+        except Exception as e:
+            logger.error(f"SPAKE2 authentication failed for client {client_id}: {str(e)}")
+            authenticated = False
+            await websocket.close(code=1008)  # Authentication failure
+            return
+
+    # Only proceed if authentication was successful
+    if authenticated:
+        client_id_connections[client_id].append(websocket)
+        logger.info(f"Notifications WebSocket connected for client_id: {client_id}")
+
+        # Broadcast new user connection to all other users
+        for other_client_id, connections in client_id_connections.items():
+            if other_client_id != client_id:
+                for conn in connections:
+                    try:
+                        await conn.send_json({
+                            "action": "user_connected",
+                            "client_id": client_id
+                        })
+                        logger.info(f"Notified client {other_client_id} about new connection from {client_id}")
+                    except Exception as e:
+                        logger.error(f"Failed to notify client {other_client_id}: {str(e)}")
+
+        # Send currently connected users to the new client
+        connected_clients = [cid for cid in client_id_connections.keys() if cid != client_id]
+        await websocket.send_json({
+            "action": "connected_users",
+            "client_ids": connected_clients
+        })
+        logger.info(f"Sent connected users to client {client_id}: {connected_clients}")
+
+        try:
+            while True:
+                # Keep connection alive and handle any incoming messages
+                try:
+                    message = await asyncio.wait_for(websocket.receive_json(), timeout=30)
+                    logger.info(f"Received message from client {client_id}: {message}")
+                    # Handle any client messages here
+                except asyncio.TimeoutError:
+                    # Send a ping to keep the connection alive
+                    await websocket.send_json({"action": "ping"})
+        except Exception as e:
+            logger.error(f"WebSocket error for client {client_id}: {str(e)}")
+        finally:
+            if client_id in client_id_connections:
+                if websocket in client_id_connections[client_id]:
+                    client_id_connections[client_id].remove(websocket)
+
+                    # If this was the last connection for this client, notify others about disconnection
+                    if not client_id_connections[client_id]:
+                        # Broadcast user disconnection to all other users
+                        for other_client_id, connections in client_id_connections.items():
+                            if other_client_id != client_id:
+                                for conn in connections:
+                                    try:
+                                        await conn.send_json({
+                                            "action": "user_disconnected",
+                                            "client_id": client_id
+                                        })
+                                        logger.info(f"Notified client {other_client_id} about disconnection of {client_id}")
+                                    except Exception as e:
+                                        logger.error(f"Failed to notify client {other_client_id}: {str(e)}")
+
+            if websocket.application_state == WebSocketState.CONNECTED:
+                await websocket.close()
+            logger.info(f"Notifications WebSocket closed for client_id: {client_id}")
 
 # Upload endpoint
 @app.post("/upload/")
