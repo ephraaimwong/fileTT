@@ -95,7 +95,8 @@ async def websocket_progress(websocket: WebSocket, task_id: str, client_id: str 
     logger.info(f"WebSocket connected for task_id: {task_id}, client_id: {client_id or 'unknown'}, clients: {len(websocket_clients[task_id])}, ip: {websocket.client.host}:{websocket.client.port}")
     
     # Perform SPAKE2 key exchange
-    spake2_a = SPAKE2_A(os.urandom(32))  # Use random password for simplicity
+    # spake2_a = SPAKE2_A(os.urandom(32))  # Use random password for simplicity
+    spake2_a = SPAKE2_A(b"fixed_password_32_bytes_long_1234")  # Fixed password for testing
     msg_out = spake2_a.start()
     await websocket.send_json({"spake2_msg": base64.b64encode(msg_out).decode()})
     
@@ -304,12 +305,19 @@ async def upload_file(file: UploadFile = File(...), task_id: str = Form(...)):
                     await file.close()
                     return {"message": f"Upload canceled for {file.filename}", "task_id": task_id}
 
-                # Encrypt chunk if session key exists (set via WebSocket)
-                if task_id in session_keys:
-                    iv, ciphertext, tag = encrypt_data(chunk, session_keys[task_id])
-                    f.write(iv + tag + ciphertext)  # Store encrypted data
-                else:
-                    f.write(chunk)  # Fallback to unencrypted
+                # # Encrypt chunk if session key exists (set via WebSocket)
+                # if task_id in session_keys:
+                #     iv, ciphertext, tag = encrypt_data(chunk, session_keys[task_id])
+                #     f.write(iv + tag + ciphertext)  # Store encrypted data
+                # # else:
+                # #     f.write(chunk)  # Fallback to unencrypted
+                
+                # Encrypt chunk (no unencrypted fallback)
+                if task_id not in session_keys:
+                    logger.error(f"No session key for task_id: {task_id}, cannot encrypt")
+                    raise HTTPException(status_code=400, detail="Encryption key not established")
+                iv, ciphertext, tag = encrypt_data(chunk, session_keys[task_id])
+                f.write(iv + tag + ciphertext)  # Store encrypted data
                     
                 f.flush()  # Ensure data is written to disk
                 bytes_read += len(chunk)
