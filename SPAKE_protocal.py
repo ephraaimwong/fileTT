@@ -1,43 +1,47 @@
-#from spake2 import SPAKE2_A, SPAKE2_B
-import receive
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from spake2 import SPAKE2_A
-from websocket import send
+from fastapi import WebSocket
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+import os
 
-s = SPAKE2_A(b"our password")
-msg_out = s.start()
-send(msg_out) # this is message A->B
-msg_in = receive()
-key = s.finish(msg_in)
+async def send_encrypted_file(
+    ws: WebSocket,
+    file_path: str,
+    aesgcm: AESGCM,
+    nonce: bytes,
+    chunk_size: int = 64 * 1024
+):
+    """
+    Encrypts and streams the contents of `file_path` over the WebSocket.
+    Each chunk is encrypted with the same nonce (you may rotate per chunk if you like).
+    """
+    # 1) Send filename metadata first
+    await ws.send_json({
+        "type": "file",
+        "filename": os.path.basename(file_path),
+        "nonce": nonce.hex(),
+    })
 
-confirm_A = HKDF(key, info="confirm_A", length=32)
-expected_confirm_B = HKDF(key, info="confirm_B", length=32)
-send(confirm_A)
-confirm_B = receive()
-assert confirm_B == expected_confirm_B
+    # 2) Open and stream encrypted chunks
+    with open(file_path, "rb") as f:
+        while True:
+            plaintext = f.read(chunk_size)
+            if not plaintext:
+                break
+            ciphertext = aesgcm.encrypt(nonce, plaintext, None)
+            await ws.send_bytes(ciphertext)  # whole binary frame :contentReference[oaicite:0]{index=0}
 
+    # 3) Signal end-of-file (optional)
+    await ws.send_json({"type": "file_end"})  # so server knows to stop reading
 
-from spake2 import SPAKE2_B
-q = SPAKE2_B(b"our password")
-msg_out = q.start()
-send(msg_out)
-msg_in = receive() # this is message A->B
-key = q.finish(msg_in)
-
-
-#password = b"our password"
-#
-#alice = SPAKE2_A(password)
-#bob   = SPAKE2_B(password)
-#
-## Each side creates an outbound message
-#msg_from_alice = alice.start()
-#msg_from_bob   = bob.start()
-#
-## Simulate exchanging messages by swapping them
-#shared_key_alice = alice.finish(msg_from_bob)
-#shared_key_bob   = bob.finish(msg_from_alice)
-#
-## Both parties now share the same key
-#print("Alice's key:", shared_key_alice.hex())
-#print("Bob's key:  ", shared_key_bob.hex())
+async def send_encrypted_message(
+    ws: WebSocket,
+    message: str,
+    aesgcm: AESGCM,
+    nonce: bytes
+):
+    plaintext = message.encode("utf-8")
+    ciphertext = aesgcm.encrypt(nonce, plaintext, None)  # AES-GCM AEAD :contentReference[oaicite:1]{index=1}
+    # send as hex in a JSON wrapper so server can parse it
+    await ws.send_json({
+        "type": "message",
+        "payload": ciphertext.hex(),
+    })

@@ -1,20 +1,20 @@
-from cryptography.hazmat.primitives import hashes
 from fastapi import FastAPI, UploadFile, File, WebSocket, Form, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from spake2 import SPAKE2_A
+import asyncio
+import base64
+import logging
 import os
 import uuid
 from collections import defaultdict
-import asyncio
-import logging
 from contextlib import asynccontextmanager
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-import base64
-from starlette.websockets import WebSocketState
 
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from fastapi import FastAPI, UploadFile, File, WebSocket, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from spake2 import SPAKE2_Symmetric
+from starlette.websockets import WebSocketState
 
 # Configure logging
 # logging.basicConfig(level=logging.INFO)
@@ -39,13 +39,12 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 progress_tracker = defaultdict(lambda: {"progress": 0, "message": "Pending", "completed": False, "canceled": False})
 websocket_clients = defaultdict(list)
 cancel_events = defaultdict(asyncio.Event)
-session_keys = {}  # Store SPAKE2-derived keys per task_id
+session_keys = {}  #
 client_id_connections = defaultdict(list) # Store client_id to WebSocket connections
 
-# SPAKE2 stuff below
-def hkdf_expand(session_secret_key, info, length=32):
+def gen_hkdf(session_secret_key, info, length=32):
     """
-    Expands key for encryption and key confirmation.
+    hkdf key generator
     :param session_secret_key: Session secret key from SPAKE2
     :param info: Tag to identify the key
     :param length: Key length
@@ -59,7 +58,6 @@ def hkdf_expand(session_secret_key, info, length=32):
         info=info.encode()
     ).derive(session_secret_key)
     
-# Encrypt data using AES-GCM
 def encrypt_data(data, key):
     """
     Encrypts data using AES-GCM.
@@ -67,23 +65,22 @@ def encrypt_data(data, key):
     :param key: 32-byte encryption key
     :return: (iv, ciphertext, tag)
     """
-    iv = os.urandom(12)
+    iv = os.urandom(12)#salt
     cipher = Cipher(algorithms.AES(key), modes.GCM(iv))
     encryptor = cipher.encryptor()
     ciphertext = encryptor.update(data) + encryptor.finalize()
     return iv, ciphertext, encryptor.tag
 
-# Decrypt data using AES-GCM
-def decrypt_data(iv, ciphertext, tag, key):
+def decrypt_data(iv, ciphertext, tag, session_key):
     """
     Decrypts data using AES-GCM.
-    :param iv: Initialization vector
-    :param ciphertext: Encrypted data
-    :param tag: Authentication tag
-    :param key: 32-byte encryption key
+    :param iv: our salt from prev encryption
+    :param ciphertext:
+    :param tag: auth tag from original HKDF key
+    :param session_key: key gen from HKDF
     :return: Decrypted data
     """
-    cipher = Cipher(algorithms.AES(key), modes.GCM(iv, tag))
+    cipher = Cipher(algorithms.AES(session_key), modes.GCM(iv, tag))
     decryptor = cipher.decryptor()
     return decryptor.update(ciphertext) + decryptor.finalize()
 
@@ -93,53 +90,22 @@ async def websocket_progress(websocket: WebSocket, task_id: str, client_id: str 
     await websocket.accept()
     websocket_clients[task_id].append(websocket)
     logger.info(f"WebSocket connected for task_id: {task_id}, client_id: {client_id or 'unknown'}, clients: {len(websocket_clients[task_id])}, ip: {websocket.client.host}:{websocket.client.port}")
-    
-    # Perform SPAKE2 key exchange
-    spake2_a = SPAKE2_A(os.urandom(32))  # Use random password for simplicity
-    msg_out = spake2_a.start()
+    #todo, bind pss to some input box??
+    spake2 = SPAKE2_Symmetric(pss)
+    msg_out = spake2.start()
     await websocket.send_json({"spake2_msg": base64.b64encode(msg_out).decode()})
     
     try:
         # Receive client's SPAKE2 message
-        msg_in_data = await websocket.receive_json()
-        msg_in = base64.b64decode(msg_in_data.get("spake2_msg", ""))
-        session_key = spake2_a.finish(msg_in)
-        derived_key = hkdf_expand(session_key, "file_encryption")
-        session_keys[task_id] = derived_key
-        logger.info(f"SPAKE2 key exchange completed for task_id: {task_id}")
-        
+        await reciever(spake2, task_id, websocket)
+
         while True:
             # send server-side progress updates to the client
             progress_data = progress_tracker[task_id]
             logger.info(f"Sending progress for {task_id}: {progress_data}")
             await websocket.send_json(progress_data)
-            
-            #check for cancellation requests from the client
-            try:
-                message = await asyncio.wait_for(websocket.receive_json(), timeout=0.5)
-                if message.get("action") == "cancel":
-                    progress_tracker[task_id]["canceled"] = True
-                    
-                    if task_id not in cancel_events:
-                        cancel_events[task_id] = asyncio.Event()
-                        
-                    cancel_events[task_id].set()
-                    progress_tracker[task_id]["message"] = "Upload canceled by client"
-                    logger.info(f"Cancellation request for task:{task_id} received via WebSocket")
-                elif message.get("action") == "upload_chunk":
-                    # Handle encrypted file chunk
-                    iv = base64.b64decode(message["iv"])
-                    ciphertext = base64.b64decode(message["ciphertext"])
-                    tag = base64.b64decode(message["tag"])
-                    chunk = decrypt_data(iv, ciphertext, tag, session_keys[task_id])
-                    filepath = os.path.join(UPLOAD_DIR, message["filename"])
-                    with open(filepath, "ab") as f:
-                        f.write(chunk)
-                    progress_tracker[task_id]["progress"] = message.get("progress", 0)
-                    progress_tracker[task_id]["message"] = f"Received chunk for {message['filename']}"
-                    logger.info(f"Received chunk for {task_id}, progress: {progress_tracker[task_id]['progress']}%")
-            except asyncio.TimeoutError:
-                pass # no message received, continue to send progress updates
+
+            await cancellation_req_check(task_id, websocket)
             if progress_data["completed"] or progress_data["canceled"]:
                 logger.info(f"Progress complete or canceled for task: {task_id}, closing WebSocket")
                 break
@@ -161,7 +127,44 @@ async def websocket_progress(websocket: WebSocket, task_id: str, client_id: str 
                 if task_id in session_keys:
                     del session_keys[task_id]
 
-# WebSocket endpoint for notifications
+
+async def cancellation_req_check(task_id, websocket):
+    try:
+        message = await asyncio.wait_for(websocket.receive_json(), timeout=0.5)
+        if message.get("action") == "cancel":
+            progress_tracker[task_id]["canceled"] = True
+
+            if task_id not in cancel_events:
+                cancel_events[task_id] = asyncio.Event()
+
+            cancel_events[task_id].set()
+            progress_tracker[task_id]["message"] = "Upload canceled by client"
+            logger.info(f"Cancellation request for task:{task_id} received via WebSocket")
+        elif message.get("action") == "upload_chunk":
+            # Handle encrypted file chunk
+            iv = base64.b64decode(message["iv"])
+            ciphertext = base64.b64decode(message["ciphertext"])
+            tag = base64.b64decode(message["tag"])
+            chunk = decrypt_data(iv, ciphertext, tag, session_keys[task_id])
+            filepath = os.path.join(UPLOAD_DIR, message["filename"])
+            with open(filepath, "ab") as f:
+                f.write(chunk)
+            progress_tracker[task_id]["progress"] = message.get("progress", 0)
+            progress_tracker[task_id]["message"] = f"Received chunk for {message['filename']}"
+            logger.info(f"Received chunk for {task_id}, progress: {progress_tracker[task_id]['progress']}%")
+    except asyncio.TimeoutError:
+        pass  # no message received, continue to send progress updates
+
+
+async def reciever(spake2, task_id, websocket):
+    msg_in_data = await websocket.receive_json()
+    msg_in = base64.b64decode(msg_in_data.get("spake2_msg", ""))
+    session_key = spake2.finish(msg_in)
+    derived_key = gen_hkdf(session_key, "file_encryption")
+    session_keys[task_id] = derived_key
+    logger.info(f"SPAKE2 key exchanged: {task_id}")
+
+
 @app.websocket("/ws/notifications")
 async def websocket_notifications(websocket: WebSocket, client_id: str = None):
     try:
@@ -331,12 +334,8 @@ async def upload_file(file: UploadFile = File(...), task_id: str = Form(...)):
                 return {"message": f"Upload canceled for {file.filename}", "task_id": task_id}
 
             # Upload completed successfully
-            f.flush()
-            progress_tracker[task_id]["progress"] = 100
-            progress_tracker[task_id]["completed"] = True
-            progress_tracker[task_id]["message"] = f"File {file.filename} uploaded successfully"
-            logger.info(f"Upload completed for {task_id}")
-            
+            await finish_upload(f, file, task_id)
+
             # --- AUTO-FETCH CHANGE ---
             if progress_tracker[task_id]["completed"] and not progress_tracker[task_id]["canceled"]:
                 await broadcast_upload_complete(task_id, file.filename)
@@ -353,7 +352,15 @@ async def upload_file(file: UploadFile = File(...), task_id: str = Form(...)):
         if progress_tracker[task_id]["canceled"] or progress_tracker[task_id]["completed"]:
             if task_id in cancel_events:
                 del cancel_events[task_id]
-                
+
+
+async def finish_upload(f, file, task_id):
+    f.flush()
+    progress_tracker[task_id]["progress"] = 100
+    progress_tracker[task_id]["completed"] = True
+    progress_tracker[task_id]["message"] = f"File {file.filename} uploaded successfully"
+    logger.info(f"Upload completed for {task_id}")
+
 
 # Cancel endpoint
 @app.post("/cancel/{task_id}")
@@ -363,7 +370,6 @@ async def cancel_upload(task_id: str):
         
         if task_id not in cancel_events:
             cancel_events[task_id] = asyncio.Event()
-            
         cancel_events[task_id].set()
         progress_tracker[task_id]["message"] = "Upload canceled by client"
         logger.info(f"Cancellation requested for task_id: {task_id} via cancel endpoint")

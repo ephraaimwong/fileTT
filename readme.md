@@ -28,7 +28,7 @@ assert confirm_B == expected_confirm_B
 ```
 Which tests for identical keys. We will cover what and how HKDF is made later. 
 
-If we wanted to settle not having to establish SPAKE2_A, we can implement ``SPAKE2_Symmetric``, which removes the issue of agreeing beforehand which roles both users will play. This is played out like so:
+Additionally we wan to settle not having to establish who is SPAKE2_A, so we implement ``SPAKE2_Symmetric``, which removes the issue of agreeing beforehand which roles both users will play. This plays out to something like such: 
 ```python
 s1 = SPAKE2_Symmetric(agreed_password) # Create password
 outmsg1 = s1.start() #create msg
@@ -37,11 +37,18 @@ send(outmsg1)# send msg
 inmsg2 = receive() # recieve the other users msg
 key = s1.finish(inmsg2) #verify 
 ```
-Though for our purposes, this isn't exactly needed, but is good to keep in mind that is possible to have. 
+Though for our purposes, this isn't exactly needed, we wanted to keep it simple with only one file/program to run out of and not give the user too much choice/option. 
 # Encryption 
 We chose the standard cryptography python import from `pip install cryptography.hazmat.primitives`, given that we are dealing with the raw types. 
 
-To encrypt our messages, we chose [HMAC-based Extract-and-Expand Key Derivation Function (HKDF)](https://datatracker.ietf.org/doc/html/rfc5869) along with a basic *SHA256* hash function and add *salt* results in a unique string every time, even if the *same message* is sent for n-large times, which leads us to the following implmentation:
+To encrypt our messages, we follow the following model
+1. SPAKE2 --> shared secret 
+2. HKDF(shared secret) --> strong symmetric key
+3. AES-GCM(message, key from HKDF) --> encrypted message
+
+The SPAKE2 part is pretty simple as we saw above.
+
+To create our we chose [HMAC-based Extract-and-Expand Key Derivation Function (HKDF)](https://datatracker.ietf.org/doc/html/rfc5869) along with a basic *SHA256* hash function and add *salt* results in a unique string every time, even if the *same message* is sent for n-large times, which leads us to the following implementation:
 ```python
 def hkdf_expand(session_secret_key, info, length=32):  
 	salt = os.urandom(16)  
@@ -65,6 +72,35 @@ From [cryptography.io](https://cryptography.io/en/latest/hazmat/primitives/key-d
 > 
 > [HKDF](https://en.wikipedia.org/wiki/HKDF) (HMAC-based Extract-and-Expand Key Derivation Function) is suitable for deriving keys of a fixed size used for other cryptographic operations.
 
+After creating the HKDF session key, we used [AES-GCM](https://cryptography.io/en/latest/hazmat/primitives/aead/) to actually encrypt each of our outbound messages.  
+
+```python
+def encrypt_data(data, key):
+    """
+    Encrypts data using AES-GCM.
+    :param data: Data to encrypt
+    :param key: 32-byte encryption key
+    :return: (iv, ciphertext, tag)
+    """
+    iv = os.urandom(12)# salt the AES
+    cipher = Cipher(algorithms.AES(key), modes.GCM(iv))
+    encryptor = cipher.encryptor()
+    ciphertext = encryptor.update(data) + encryptor.finalize()
+    return iv, ciphertext, encryptor.tag
+
+def decrypt_data(iv, ciphertext, tag, session_key):
+    """
+    Decrypts data using AES-GCM.
+    :param iv: esentially salt
+    :param ciphertext: Encrypted data
+    :param tag: auth tag from original HKDF key
+    :param session_key: key gen from HKDF
+    :return: Decrypted data
+    """
+    cipher = Cipher(algorithms.AES(session_key), modes.GCM(iv, tag))
+    decryptor = cipher.decryptor()
+    return decryptor.update(ciphertext) + decryptor.finalize()
+```
 
 Once one of the users end the session, the key should **no longer be used** and should be considered exposed. If both users wish to contact each other again they should go through the same protocal of a shared password and setting up the initial connection again. Hence, the keys used to communicate should be treated as *one-time throwaway keys*, and are "*updated*" (more accurately remade) everytime the connection is re-established.  
 # WebSockets & Frontend Implementation 
@@ -97,9 +133,22 @@ ___
 - [x] With a key no less than 56 bits, what cipher you should use?
 - [x] DO NOT directly use the password as the key, how can you generate the same key between Alice and Bob to encrypt messages?
 - [x] What will be used for padding?
-- [x] A graphical user interface (GUI) is strongly preferred. When send a message, display the sent ciphertext. When receive a message, display the received ciphertext and decrypted plaintext.
+- [ ] A graphical user interface (GUI) is strongly preferred. When send a message, display the sent ciphertext. When receive a message, display the received ciphertext and decrypted plaintext.
 - [x] How should Alice and Bob set up an initial connection and also maintain the connection with each other on the Internet? (You may refer to socket/network programming in a particular computer language)
 - [x] If Alice or Bob sends the same message multiple times (e.g., they may say “ok” many times), it is desirable to generate different ciphertext each time. How to implement this?
 - [x] Design a key management mechanism to periodically update the key used between Alice and Bob. Justify why the design can enhance security.
 - [x] Think about this scenario: if you can **hide the detailed procedure of your encryption algorithm**, how would you improve the security by designing a new algorithm? For example, you may do two encryptions using different standard ciphers, then XOR the two outputs together. Please give your new design and justify its security and efficiency. (5 pts) 
 - [x] If Alice and Bob do not have a pre-shared password (or passphrase) and wish to establish a secure connection, **they should use a protocol that allows them to authenticate each other and negotiate a shared secret over an insecure channel**. Please explain your design and implement it in your project. Note, if you choose to complete this question, you do not need to assume that Alice and Bob share the same password. (5 pts)
+
+
+
+# Deps:
+Backend:
+- Uvicorn for ASGI server (Maybe not using?)
+- FastAPI as main web framework 
+- [SPAKE2](https://github.com/warner/python-spake2)
+- [cryptography.io](https://cryptography.io/en/latest/hazmat/primitives/key-derivation-functions/#cryptography.hazmat.primitives.kdf.hkdf.HKDF)
+- 
+
+Frontend:
+- 
